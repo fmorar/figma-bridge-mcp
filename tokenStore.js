@@ -12,7 +12,9 @@ export function createTokenStore(opts = {}) {
   const filename = opts.filename || "figma-token.json";
 
   const filePathRaw =
-    typeof opts.file === "string" && opts.file.trim().length > 0 ? opts.file.trim() : path.join(dir, filename);
+    typeof opts.file === "string" && opts.file.trim().length > 0
+      ? opts.file.trim()
+      : path.join(dir, filename);
 
   const filepath = path.resolve(filePathRaw);
   const parentDir = path.dirname(filepath);
@@ -43,6 +45,6 @@ export function createTokenStore(opts = {}) {
         console.error("[tokenStore.save] failed:", e);
         return { ok: false, error: e?.message || String(e) };
       }
-    }
+    },
   };
 }

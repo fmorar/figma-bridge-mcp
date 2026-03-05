@@ -1,5 +1,10 @@
 // mcpRouter.js
-import { figmaGetFile, figmaGetNodes, figmaGetLocalVariables, figmaCreateVariables } from "./figmaApi.js";
+import {
+  figmaGetFile,
+  figmaGetNodes,
+  figmaGetLocalVariables,
+  figmaCreateVariables,
+} from "./figmaApi.js";
 import { createManifestStore } from "./manifestStore.js";
 
 const TOOLS = [
@@ -9,8 +14,8 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: { fileKey: { type: "string" } },
-      required: ["fileKey"]
-    }
+      required: ["fileKey"],
+    },
   },
   {
     name: "figma_get_nodes",
@@ -19,27 +24,33 @@ const TOOLS = [
       type: "object",
       properties: {
         fileKey: { type: "string" },
-        nodeIds: { type: "array", items: { type: "string" } }
+        nodeIds: { type: "array", items: { type: "string" } },
       },
-      required: ["fileKey", "nodeIds"]
-    }
+      required: ["fileKey", "nodeIds"],
+    },
   },
+
+  // ---- Vertical slice C tools ----
   {
     name: "tokens_bootstrap_from_brand",
-    description: "Create primitive + semantic tokens (Figma Variables) from a brand pack (Light/Desktop).",
+    description:
+      "Create primitive + semantic tokens (Figma Variables) from a brand pack (Light/Desktop).",
     inputSchema: {
       type: "object",
       properties: {
         fileKey: { type: "string" },
         brand: {
           type: "object",
-          properties: { colors: { type: "object" }, typography: { type: "object" } },
-          required: ["colors", "typography"]
+          properties: {
+            colors: { type: "object" },
+            typography: { type: "object" },
+          },
+          required: ["colors", "typography"],
         },
-        mode: { type: "string", enum: ["Light"], default: "Light" }
+        mode: { type: "string", enum: ["Light"], default: "Light" },
       },
-      required: ["fileKey", "brand"]
-    }
+      required: ["fileKey", "brand"],
+    },
   },
   {
     name: "tokens_export_map",
@@ -47,17 +58,20 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: { fileKey: { type: "string" } },
-      required: ["fileKey"]
-    }
+      required: ["fileKey"],
+    },
   },
   {
     name: "project_manifest_write",
     description: "Write project manifest snapshot (phase=ds) to server-side store.",
     inputSchema: {
       type: "object",
-      properties: { fileKey: { type: "string" }, manifest: { type: "object" } },
-      required: ["fileKey", "manifest"]
-    }
+      properties: {
+        fileKey: { type: "string" },
+        manifest: { type: "object" },
+      },
+      required: ["fileKey", "manifest"],
+    },
   },
   {
     name: "project_manifest_read",
@@ -65,26 +79,36 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: { fileKey: { type: "string" } },
-      required: ["fileKey"]
-    }
-  }
+      required: ["fileKey"],
+    },
+  },
 ];
 
 function textResult(obj) {
-  return { content: [{ type: "text", text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2) }] };
+  return {
+    content: [
+      {
+        type: "text",
+        text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2),
+      },
+    ],
+  };
 }
 
 function parseAuth(req) {
   const h = (req.get("authorization") || "").trim();
   const m = h.match(/^Bearer\s+(.+)$/i);
   const bearer = m?.[1]?.trim();
+
   const q = (req.query?.authKey || "").toString().trim();
   const x = (req.get("x-mcp-auth") || "").toString().trim();
+
   return bearer || q || x || null;
 }
 
 function attachAuth({ sharedKey }) {
   return function authorized(req) {
+    // If you don't set MCP_AUTH_KEY, dev is open
     if (!sharedKey) return true;
     const key = parseAuth(req);
     return Boolean(key && key === sharedKey);
@@ -110,6 +134,7 @@ function startSSE(req, res) {
 
 function normalizeToolName(name) {
   if (!name || typeof name !== "string") return name;
+  // Some agent platforms prefix tool names (e.g., "a_tokens_bootstrap_from_brand")
   if (name.startsWith("a_")) return name.slice(2);
   return name;
 }
@@ -118,7 +143,7 @@ function jsonRpcError(res, { id, code, message, data }) {
   return res.status(200).json({
     jsonrpc: "2.0",
     id: id ?? null,
-    error: { code, message, ...(data ? { data } : {}) }
+    error: { code, message, ...(data ? { data } : {}) },
   });
 }
 
@@ -126,6 +151,7 @@ function hexToRgba01(hex) {
   const h = (hex || "").replace("#", "").trim();
   const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
   if (full.length !== 6) return null;
+
   const r = parseInt(full.slice(0, 2), 16) / 255;
   const g = parseInt(full.slice(2, 4), 16) / 255;
   const b = parseInt(full.slice(4, 6), 16) / 255;
@@ -139,14 +165,14 @@ function buildVariablesPayload({ brand }) {
     "color.primary": colors.primary,
     "color.accent": colors.accent,
     "color.neutral.900": colors.neutral || "#111827",
-    "color.background": colors.background || "#FFFFFF"
+    "color.background": colors.background || "#FFFFFF",
   };
 
   const sem = {
     "semantic.bg": prim["color.background"],
     "semantic.fg": prim["color.neutral.900"],
     "semantic.brand": prim["color.primary"],
-    "semantic.accent": prim["color.accent"]
+    "semantic.accent": prim["color.accent"],
   };
 
   const variables = [];
@@ -155,7 +181,7 @@ function buildVariablesPayload({ brand }) {
     variables.push({
       name,
       resolvedType: "COLOR",
-      valuesByMode: { Light: rgba }
+      valuesByMode: { Light: rgba },
     });
   }
 
@@ -173,7 +199,7 @@ function buildCssExport({ brand }) {
     `  --color-fg: ${c.neutral || "#111827"};`,
     `  --color-bg: ${c.background || "#FFFFFF"};`,
     `  --font-sans: ${t.fontFamily || "Inter"}, ui-sans-serif, system-ui;`,
-    "}"
+    "}",
   ].join("\n");
 
   const tokenMap = {
@@ -181,7 +207,7 @@ function buildCssExport({ brand }) {
     "semantic.accent": "var(--color-accent)",
     "semantic.fg": "var(--color-fg)",
     "semantic.bg": "var(--color-bg)",
-    "typography.fontFamily": "var(--font-sans)"
+    "typography.fontFamily": "var(--font-sans)",
   };
 
   return { globalsCssPreview, tokenMap };
@@ -191,13 +217,16 @@ const FIGMA_OAUTH_REQUIRED = new Set([
   "figma_get_file",
   "figma_get_nodes",
   "tokens_bootstrap_from_brand",
-  "tokens_export_map"
+  "tokens_export_map",
 ]);
 
 export function attachMcpRoutes(app, tokenStore) {
   const authorized = attachAuth({ sharedKey: process.env.MCP_AUTH_KEY });
-  const manifestStore = createManifestStore({ dir: process.env.MANIFEST_STORE_DIR || ".data/manifests" });
+  const manifestStore = createManifestStore({
+    dir: process.env.MANIFEST_STORE_DIR || ".data/manifests",
+  });
 
+  // /mcp can return JSON tools OR open an SSE stream depending on Accept header
   app.get("/mcp", (req, res) => {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     const accept = (req.get("accept") || "").toLowerCase();
@@ -205,11 +234,13 @@ export function attachMcpRoutes(app, tokenStore) {
     return startSSE(req, res);
   });
 
+  // Force SSE content-type for strict clients
   app.get("/mcp/sse", (req, res) => {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     return startSSE(req, res);
   });
 
+  // Tools listing compatibility
   function toolsCompat(req, res) {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     return res.json({ tools: TOOLS });
@@ -228,7 +259,7 @@ export function attachMcpRoutes(app, tokenStore) {
         id,
         code: 401,
         message:
-          "Unauthorized: missing/invalid MCP_AUTH_KEY. Provide Authorization: Bearer <key> or ?authKey=<key> or x-mcp-auth:<key>."
+          "Unauthorized: missing/invalid MCP_AUTH_KEY. Provide Authorization: Bearer <key> or ?authKey=<key> or x-mcp-auth:<key>.",
       });
     }
 
@@ -244,8 +275,8 @@ export function attachMcpRoutes(app, tokenStore) {
           result: {
             protocolVersion: "2025-03-26",
             serverInfo: { name: "figma-bridge-mcp", version: "1.1.0" },
-            capabilities: { tools: {} }
-          }
+            capabilities: { tools: {} },
+          },
         });
       }
 
@@ -287,17 +318,30 @@ export function attachMcpRoutes(app, tokenStore) {
         }
 
         if (toolName === "figma_get_nodes") {
-          const out = await figmaGetNodes({ accessToken, fileKey: args.fileKey, nodeIds: args.nodeIds });
+          const out = await figmaGetNodes({
+            accessToken,
+            fileKey: args.fileKey,
+            nodeIds: args.nodeIds,
+          });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
+        // Slice C tools
         if (toolName === "tokens_bootstrap_from_brand") {
           const payload = buildVariablesPayload({ brand: args.brand });
+
           const out = await figmaCreateVariables({
             accessToken,
             fileKey: args.fileKey,
-            payload: { variables: payload.variables }
+            payload: { variables: payload.variables },
           });
+
+          const hint =
+            out.status === 403
+              ? "Figma denied variables write (403). This often means missing scope/permissions or plan restrictions for Variables endpoints."
+              : out.status === 400
+              ? "Figma rejected the request (400). Check the payload schema + that your app scopes match what you selected in the Figma Developer Portal."
+              : null;
 
           return res.json({
             jsonrpc: "2.0",
@@ -305,14 +349,16 @@ export function attachMcpRoutes(app, tokenStore) {
             result: textResult({
               ok: out.ok,
               status: out.status,
+              hint,
               responseBody: out.body,
-              typography: payload.typography
-            })
+              typography: payload.typography,
+            }),
           });
         }
 
         if (toolName === "tokens_export_map") {
           const vars = await figmaGetLocalVariables({ accessToken, fileKey: args.fileKey });
+
           return res.json({
             jsonrpc: "2.0",
             id,
@@ -320,8 +366,8 @@ export function attachMcpRoutes(app, tokenStore) {
               localVariablesStatus: vars.status,
               localVariablesOk: vars.ok,
               localVariablesBody: vars.body,
-              export: buildCssExport({ brand: args.brand || { colors: {}, typography: {} } })
-            })
+              export: buildCssExport({ brand: args.brand || { colors: {}, typography: {} } }),
+            }),
           });
         }
 
@@ -335,11 +381,12 @@ export function attachMcpRoutes(app, tokenStore) {
         id,
         code: -32000,
         message: err?.message || "Tool call failed",
-        data: { stack: err?.stack }
+        data: { stack: err?.stack },
       });
     }
   }
 
+  // JSON-RPC endpoints
   app.post("/mcp", handleRpc);
   app.post("/mcp/sse", handleRpc);
 }

@@ -13,23 +13,38 @@ const app = express();
 const PORT = Number(process.env.PORT || 3333);
 
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+
 const FIGMA_CLIENT_ID = process.env.FIGMA_CLIENT_ID;
 const FIGMA_CLIENT_SECRET = process.env.FIGMA_CLIENT_SECRET;
+
+/**
+ * Figma OAuth scopes:
+ * - You can pass space-separated OR comma-separated scopes (Figma supports both). :contentReference[oaicite:3]{index=3}
+ * - Recommended minimum for reading file content:
+ *   file_content:read, file_metadata:read, current_user:read :contentReference[oaicite:4]{index=4}
+ *
+ * If you want to attempt Variables writes, you may need additional scopes/permissions/plan.
+ */
+const FIGMA_SCOPES =
+  (process.env.FIGMA_SCOPES || "file_content:read file_metadata:read current_user:read").trim();
+
+const IS_HTTPS = BASE_URL.startsWith("https://");
 
 // Parsers
 app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
 
-// Simple root (avoid "Cannot GET /")
+// Root (avoid "Cannot GET /")
 app.get("/", (req, res) => {
   res.status(200).json({
     ok: true,
     service: "figma-bridge-mcp",
-    endpoints: ["/mcp", "/mcp/tools", "/mcp/sse", "/auth/figma/login", "/auth/figma/callback"]
+    baseUrl: BASE_URL,
+    endpoints: ["/mcp", "/mcp/tools", "/mcp/sse", "/auth/figma/login", "/auth/figma/callback"],
   });
 });
 
-// ---- Crash visibility (prevents silent timeouts) ----
+// Crash visibility (prevents silent timeouts)
 process.on("unhandledRejection", (reason) => {
   console.error("[unhandledRejection]", reason);
 });
@@ -40,40 +55,57 @@ process.on("uncaughtException", (err) => {
 // Token store
 const tokenStore = createTokenStore({
   dir: process.env.TOKEN_STORE_DIR || ".data",
-  filename: process.env.TOKEN_STORE_FILE || "figma-token.json"
+  filename: process.env.TOKEN_STORE_FILE || "figma-token.json",
 });
 
-// ---- OAuth helpers ----
 function requireOAuthEnv(res) {
   if (!FIGMA_CLIENT_ID || !FIGMA_CLIENT_SECRET) {
-    res.status(500).send(
-      "Missing FIGMA_CLIENT_ID / FIGMA_CLIENT_SECRET env vars. Set them in Render env."
-    );
+    res
+      .status(500)
+      .send("Missing FIGMA_CLIENT_ID / FIGMA_CLIENT_SECRET env vars. Set them in Render env.");
     return false;
   }
   return true;
 }
 
+/**
+ * Build the Figma OAuth "scope" param.
+ * Figma accepts comma-separated or space-separated. :contentReference[oaicite:5]{index=5}
+ * We'll standardize to comma-separated (safe & explicit).
+ */
+function normalizeScopes(scopesRaw) {
+  // supports: "a b c" OR "a,b,c" OR mixed
+  const parts = scopesRaw
+    .split(/[,\s]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  // de-dupe
+  const unique = Array.from(new Set(parts));
+  return unique.join(",");
+}
+
 // ---- Figma OAuth: Login ----
 // Open this in browser to start OAuth:
-//   https://<host>/auth/figma/login
+//   https://<BASE_URL>/auth/figma/login
 app.get("/auth/figma/login", (req, res) => {
   if (!requireOAuthEnv(res)) return;
 
   const state = crypto.randomBytes(16).toString("hex");
-  res.cookie("figma_oauth_state", state, { httpOnly: true, sameSite: "lax", secure: true });
+
+  // Cookie must be secure only on HTTPS; otherwise localhost http breaks
+  res.cookie("figma_oauth_state", state, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: IS_HTTPS,
+  });
 
   const redirectUri = `${BASE_URL}/auth/figma/callback`;
 
-  // Figma OAuth authorize endpoint
   const url = new URL("https://www.figma.com/oauth");
   url.searchParams.set("client_id", FIGMA_CLIENT_ID);
   url.searchParams.set("redirect_uri", redirectUri);
-
-  // Scopes: start with read-only. Add write if you want to create variables.
-  // If variables creation requires write scopes, upgrade later.
-  // Many devs use: "file_read file_write"
-  url.searchParams.set("scope", "file_read");
+  url.searchParams.set("scope", normalizeScopes(FIGMA_SCOPES));
   url.searchParams.set("response_type", "code");
   url.searchParams.set("state", state);
 
@@ -82,7 +114,7 @@ app.get("/auth/figma/login", (req, res) => {
 
 // ---- Figma OAuth: Callback ----
 // Redirect URL must be set in Figma App settings:
-//   https://<host>/auth/figma/callback
+//   https://<BASE_URL>/auth/figma/callback
 app.get("/auth/figma/callback", async (req, res) => {
   if (!requireOAuthEnv(res)) return;
 
@@ -106,7 +138,7 @@ app.get("/auth/figma/callback", async (req, res) => {
 
     const tokenRes = await fetch(tokenUrl.toString(), {
       method: "POST",
-      headers: { Accept: "application/json" }
+      headers: { Accept: "application/json" },
     });
 
     const tokenText = await tokenRes.text();
@@ -119,7 +151,9 @@ app.get("/auth/figma/callback", async (req, res) => {
 
     if (!tokenRes.ok || !token?.access_token) {
       console.error("[figma oauth] token exchange failed:", tokenRes.status, token);
-      return res.status(500).send(`OAuth failed (status ${tokenRes.status}). Check logs.`);
+      return res
+        .status(500)
+        .send(`OAuth failed (status ${tokenRes.status}). Check logs. Body: ${tokenText}`);
     }
 
     const saveResult = tokenStore.save(token);
@@ -130,7 +164,15 @@ app.get("/auth/figma/callback", async (req, res) => {
 
     res.clearCookie("figma_oauth_state");
     res.status(200).send(
-      "✅ Figma OAuth success. Token stored. You can now run MCP tools (figma_get_file, tokens_bootstrap_from_brand, etc.)."
+      [
+        "✅ Figma OAuth success. Token stored.",
+        "",
+        "Next:",
+        `- Try GET: ${BASE_URL}/mcp/tools?authKey=<MCP_AUTH_KEY>`,
+        `- Then tools/call via your agent.`,
+        "",
+        `Scopes used: ${normalizeScopes(FIGMA_SCOPES)}`,
+      ].join("\n")
     );
   } catch (err) {
     console.error("[figma oauth] error:", err);
@@ -145,11 +187,12 @@ attachMcpRoutes(app, tokenStore);
 app.use((err, req, res, next) => {
   console.error("[express error]", err);
 
+  // MCP clients expect JSON-RPC even on errors
   if ((req.path || "").startsWith("/mcp")) {
     return res.status(200).json({
       jsonrpc: "2.0",
       id: req.body?.id ?? null,
-      error: { code: -32000, message: err?.message || "Server error" }
+      error: { code: -32000, message: err?.message || "Server error" },
     });
   }
 
@@ -162,4 +205,5 @@ app.listen(PORT, () => {
   console.log(`[server] MCP_AUTH_KEY ${process.env.MCP_AUTH_KEY ? "set" : "NOT set (dev open)"}`);
   console.log(`[server] FIGMA_CLIENT_ID ${FIGMA_CLIENT_ID ? "set" : "NOT set"}`);
   console.log(`[server] FIGMA_CLIENT_SECRET ${FIGMA_CLIENT_SECRET ? "set" : "NOT set"}`);
+  console.log(`[server] FIGMA_SCOPES=${normalizeScopes(FIGMA_SCOPES)}`);
 });
