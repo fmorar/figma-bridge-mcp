@@ -54,7 +54,8 @@ const TOOLS = [
   },
   {
     name: "tokens_export_map",
-    description: "Export tokens as CSS variables (globals.css snippet) + token map for shadcn.",
+    description:
+      "Export tokens as CSS variables (globals.css snippet) + token map for shadcn.",
     inputSchema: {
       type: "object",
       properties: { fileKey: { type: "string" } },
@@ -66,10 +67,7 @@ const TOOLS = [
     description: "Write project manifest snapshot (phase=ds) to server-side store.",
     inputSchema: {
       type: "object",
-      properties: {
-        fileKey: { type: "string" },
-        manifest: { type: "object" },
-      },
+      properties: { fileKey: { type: "string" }, manifest: { type: "object" } },
       required: ["fileKey", "manifest"],
     },
   },
@@ -87,10 +85,7 @@ const TOOLS = [
 function textResult(obj) {
   return {
     content: [
-      {
-        type: "text",
-        text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2),
-      },
+      { type: "text", text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2) },
     ],
   };
 }
@@ -99,17 +94,14 @@ function parseAuth(req) {
   const h = (req.get("authorization") || "").trim();
   const m = h.match(/^Bearer\s+(.+)$/i);
   const bearer = m?.[1]?.trim();
-
   const q = (req.query?.authKey || "").toString().trim();
   const x = (req.get("x-mcp-auth") || "").toString().trim();
-
   return bearer || q || x || null;
 }
 
 function attachAuth({ sharedKey }) {
   return function authorized(req) {
-    // If you don't set MCP_AUTH_KEY, dev is open
-    if (!sharedKey) return true;
+    if (!sharedKey) return true; // dev open if not set
     const key = parseAuth(req);
     return Boolean(key && key === sharedKey);
   };
@@ -134,7 +126,6 @@ function startSSE(req, res) {
 
 function normalizeToolName(name) {
   if (!name || typeof name !== "string") return name;
-  // Some agent platforms prefix tool names (e.g., "a_tokens_bootstrap_from_brand")
   if (name.startsWith("a_")) return name.slice(2);
   return name;
 }
@@ -151,41 +142,10 @@ function hexToRgba01(hex) {
   const h = (hex || "").replace("#", "").trim();
   const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
   if (full.length !== 6) return null;
-
   const r = parseInt(full.slice(0, 2), 16) / 255;
   const g = parseInt(full.slice(2, 4), 16) / 255;
   const b = parseInt(full.slice(4, 6), 16) / 255;
   return { r, g, b, a: 1 };
-}
-
-function buildVariablesPayload({ brand }) {
-  const { colors, typography } = brand;
-
-  const prim = {
-    "color.primary": colors.primary,
-    "color.accent": colors.accent,
-    "color.neutral.900": colors.neutral || "#111827",
-    "color.background": colors.background || "#FFFFFF",
-  };
-
-  const sem = {
-    "semantic.bg": prim["color.background"],
-    "semantic.fg": prim["color.neutral.900"],
-    "semantic.brand": prim["color.primary"],
-    "semantic.accent": prim["color.accent"],
-  };
-
-  const variables = [];
-  for (const [name, hex] of Object.entries({ ...prim, ...sem })) {
-    const rgba = hexToRgba01(hex) || hexToRgba01("#000000");
-    variables.push({
-      name,
-      resolvedType: "COLOR",
-      valuesByMode: { Light: rgba },
-    });
-  }
-
-  return { variables, typography };
 }
 
 function buildCssExport({ brand }) {
@@ -211,6 +171,45 @@ function buildCssExport({ brand }) {
   };
 
   return { globalsCssPreview, tokenMap };
+}
+
+/**
+ * Build variable CREATE mutations (Figma expects discriminator action)
+ */
+function buildVariableCreateMutations({ brand, collectionId, modeId = "Light" }) {
+  const { colors, typography } = brand;
+
+  const prim = {
+    "color.primary": colors.primary,
+    "color.accent": colors.accent,
+    "color.neutral.900": colors.neutral || "#111827",
+    "color.background": colors.background || "#FFFFFF",
+  };
+
+  const sem = {
+    "semantic.bg": prim["color.background"],
+    "semantic.fg": prim["color.neutral.900"],
+    "semantic.brand": prim["color.primary"],
+    "semantic.accent": prim["color.accent"],
+  };
+
+  const variables = [];
+
+  for (const [name, hex] of Object.entries({ ...prim, ...sem })) {
+    const rgba = hexToRgba01(hex) || hexToRgba01("#000000");
+
+    variables.push({
+      action: "CREATE",
+      variable: {
+        name,
+        resolvedType: "COLOR",
+        variableCollectionId: collectionId,
+        valuesByMode: { [modeId]: rgba },
+      },
+    });
+  }
+
+  return { variables, typography };
 }
 
 const FIGMA_OAUTH_REQUIRED = new Set([
@@ -240,7 +239,6 @@ export function attachMcpRoutes(app, tokenStore) {
     return startSSE(req, res);
   });
 
-  // Tools listing compatibility
   function toolsCompat(req, res) {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     return res.json({ tools: TOOLS });
@@ -289,16 +287,21 @@ export function attachMcpRoutes(app, tokenStore) {
         const toolName = normalizeToolName(toolNameRaw);
         const args = params?.arguments || {};
 
+        // Load OAuth token only for Figma tools
         let accessToken = null;
         if (FIGMA_OAUTH_REQUIRED.has(toolName)) {
           const token = await (tokenStore?.load?.() ?? null);
           if (!token?.access_token) {
-            return jsonRpcError(res, { id, code: 401, message: "OAuth required: open /auth/figma/login first" });
+            return jsonRpcError(res, {
+              id,
+              code: 401,
+              message: "OAuth required: open /auth/figma/login first",
+            });
           }
           accessToken = token.access_token;
         }
 
-        // Manifest store tools (NO OAuth)
+        // ---- Manifest store tools (NO OAuth) ----
         if (toolName === "project_manifest_write") {
           const { fileKey, manifest } = args;
           const w = manifestStore.write({ fileKey, manifest });
@@ -311,53 +314,27 @@ export function attachMcpRoutes(app, tokenStore) {
           return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, manifest: m }) });
         }
 
-        // Figma tools (OAuth required)
+        // ---- Figma tools (OAuth required) ----
         if (toolName === "figma_get_file") {
-          const out = await figmaGetFile({ accessToken, fileKey: args.fileKey });
+          const out = await figmaGetFile({ accessToken: accessToken, fileKey: args.fileKey });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
         if (toolName === "figma_get_nodes") {
           const out = await figmaGetNodes({
-            accessToken,
+            accessToken: accessToken,
             fileKey: args.fileKey,
             nodeIds: args.nodeIds,
           });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
-        // Slice C tools
-        if (toolName === "tokens_bootstrap_from_brand") {
-          const payload = buildVariablesPayload({ brand: args.brand });
-
-          const out = await figmaCreateVariables({
-            accessToken,
-            fileKey: args.fileKey,
-            payload: { variables: payload.variables },
-          });
-
-          const hint =
-            out.status === 403
-              ? "Figma denied variables write (403). This often means missing scope/permissions or plan restrictions for Variables endpoints."
-              : out.status === 400
-              ? "Figma rejected the request (400). Check the payload schema + that your app scopes match what you selected in the Figma Developer Portal."
-              : null;
-
-          return res.json({
-            jsonrpc: "2.0",
-            id,
-            result: textResult({
-              ok: out.ok,
-              status: out.status,
-              hint,
-              responseBody: out.body,
-              typography: payload.typography,
-            }),
-          });
-        }
-
+        // ---- Slice C: export map ----
         if (toolName === "tokens_export_map") {
-          const vars = await figmaGetLocalVariables({ accessToken, fileKey: args.fileKey });
+          const vars = await figmaGetLocalVariables({
+            accessToken: accessToken,
+            fileKey: args.fileKey,
+          });
 
           return res.json({
             jsonrpc: "2.0",
@@ -367,6 +344,89 @@ export function attachMcpRoutes(app, tokenStore) {
               localVariablesOk: vars.ok,
               localVariablesBody: vars.body,
               export: buildCssExport({ brand: args.brand || { colors: {}, typography: {} } }),
+            }),
+          });
+        }
+
+        // ---- Slice C: bootstrap tokens (create variables) ----
+        if (toolName === "tokens_bootstrap_from_brand") {
+          const { fileKey, brand } = args;
+
+          // 1) Read local vars metadata to check collections
+          const varsMeta = await figmaGetLocalVariables({ accessToken: accessToken, fileKey });
+
+          if (!varsMeta.ok) {
+            return res.json({
+              jsonrpc: "2.0",
+              id,
+              result: textResult({
+                ok: false,
+                status: varsMeta.status,
+                note: "Failed to read local variables metadata before bootstrap.",
+                responseBody: varsMeta.body,
+              }),
+            });
+          }
+
+          const collectionsObj = varsMeta.body?.meta?.variableCollections || {};
+          const collectionList = Object.values(collectionsObj);
+          const hasAnyCollection = collectionList.length > 0;
+
+          const collectionName = "Tokens";
+          const modeId = "Light";
+
+          // If collection exists, use its id
+          // If not, we'll create one with tempId tokens_collection
+          const existingCollectionId = hasAnyCollection ? collectionList[0]?.id : null;
+          const targetCollectionId = hasAnyCollection ? existingCollectionId : "tokens_collection";
+
+          const payload = buildVariableCreateMutations({
+            brand,
+            collectionId: targetCollectionId,
+            modeId,
+          });
+
+          const requestBody = {
+            variableCollections: hasAnyCollection
+              ? []
+              : [
+                  {
+                    action: "CREATE",
+                    tempId: "tokens_collection",
+                    variableCollection: {
+                      name: collectionName,
+                      modes: [{ modeId, name: "Light" }],
+                    },
+                  },
+                ],
+            variables: payload.variables,
+          };
+
+          const out = await figmaCreateVariables({
+            accessToken: accessToken,
+            fileKey,
+            payload: requestBody,
+          });
+
+          return res.json({
+            jsonrpc: "2.0",
+            id,
+            result: textResult({
+              ok: out.ok,
+              status: out.status,
+              responseBody: out.body,
+              typography: payload.typography,
+              note: out.ok
+                ? "✅ Variables created (or accepted) by Figma."
+                : "❌ Figma rejected variable creation. See responseBody.",
+              debug: {
+                hadExistingCollection: hasAnyCollection,
+                usedCollectionId: targetCollectionId,
+                requestShape: {
+                  variableCollectionsCount: requestBody.variableCollections.length,
+                  variablesCount: requestBody.variables.length,
+                },
+              },
             }),
           });
         }
@@ -386,7 +446,6 @@ export function attachMcpRoutes(app, tokenStore) {
     }
   }
 
-  // JSON-RPC endpoints
   app.post("/mcp", handleRpc);
   app.post("/mcp/sse", handleRpc);
 }
