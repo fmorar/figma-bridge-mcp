@@ -124,6 +124,7 @@ function startSSE(req, res) {
 
 function normalizeToolName(name) {
   if (!name || typeof name !== "string") return name;
+  // Some agent platforms prefix tool names (e.g., "a_tokens_bootstrap_from_brand")
   if (name.startsWith("a_")) return name.slice(2);
   return name;
 }
@@ -160,6 +161,7 @@ function buildCssExport({ brand }) {
     "}",
   ].join("\n");
 
+  // Keep your “dot” keys here (dev-friendly), even if Figma uses slash names internally.
   const tokenMap = {
     "semantic.brand": "var(--color-brand)",
     "semantic.accent": "var(--color-accent)",
@@ -171,21 +173,20 @@ function buildCssExport({ brand }) {
   return { globalsCssPreview, tokenMap };
 }
 
-// ✅ sanitize variable names (Figma rejects "." in your endpoint)
+// ✅ sanitize variable names (Figma rejects "." in variable names)
 function sanitizeVarName(name) {
-  // Convert dot notation to slash grouping, keep it readable
-  // "color.neutral.900" -> "color/neutral/900"
   return String(name || "")
     .trim()
-    .replace(/\.+/g, "/")         // "." -> "/"
-    .replace(/\/{2,}/g, "/")      // collapse
-    .replace(/^\//, "")           // no leading /
-    .replace(/\/$/, "");          // no trailing /
+    .replace(/\.+/g, "/") // "." -> "/"
+    .replace(/\/{2,}/g, "/")
+    .replace(/^\//, "")
+    .replace(/\/$/, "");
 }
 
-function buildVariableCreateMutationsFlat({ brand, collectionId, modeId = "Light" }) {
+function buildVariableCreateMutationsFlat({ brand, collectionId, modeId }) {
   const { colors, typography } = brand;
 
+  // primitives
   const prim = {
     "color.primary": colors.primary,
     "color.accent": colors.accent,
@@ -193,6 +194,7 @@ function buildVariableCreateMutationsFlat({ brand, collectionId, modeId = "Light
     "color.background": colors.background || "#FFFFFF",
   };
 
+  // semantic mappings
   const sem = {
     "semantic.bg": prim["color.background"],
     "semantic.fg": prim["color.neutral.900"],
@@ -201,15 +203,14 @@ function buildVariableCreateMutationsFlat({ brand, collectionId, modeId = "Light
   };
 
   const variables = [];
-
   for (const [rawName, hex] of Object.entries({ ...prim, ...sem })) {
-    const name = sanitizeVarName(rawName);
     const rgba = hexToRgba01(hex) || hexToRgba01("#000000");
     variables.push({
       action: "CREATE",
-      name,
-      resolvedType: "COLOR",
+      name: sanitizeVarName(rawName),
       variableCollectionId: collectionId,
+      resolvedType: "COLOR",
+      // ✅ MUST use the real modeId (like "46:0"), not "Light"
       valuesByMode: { [modeId]: rgba },
     });
   }
@@ -221,6 +222,15 @@ function getFirstCollectionIdFromLocalVarsBody(body) {
   const collectionsObj = body?.meta?.variableCollections || {};
   const list = Object.values(collectionsObj);
   return list.find((c) => c?.id)?.id || null;
+}
+
+function getModeIdForCollection(body, collectionId) {
+  const c = body?.meta?.variableCollections?.[collectionId];
+  return (
+    c?.defaultModeId ||
+    c?.modes?.[0]?.modeId ||
+    null
+  );
 }
 
 const FIGMA_OAUTH_REQUIRED = new Set([
@@ -309,7 +319,7 @@ export function attachMcpRoutes(app, tokenStore) {
           accessToken = token.access_token;
         }
 
-        // Manifest store tools (no OAuth)
+        // ---- Manifest tools (no OAuth) ----
         if (toolName === "project_manifest_write") {
           const { fileKey, manifest } = args;
           const w = manifestStore.write({ fileKey, manifest });
@@ -322,7 +332,7 @@ export function attachMcpRoutes(app, tokenStore) {
           return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, manifest: m }) });
         }
 
-        // Figma tools
+        // ---- Figma tools ----
         if (toolName === "figma_get_file") {
           const out = await figmaGetFile({ accessToken, fileKey: args.fileKey });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
@@ -351,9 +361,9 @@ export function attachMcpRoutes(app, tokenStore) {
           });
         }
 
+        // ---- Token bootstrap ----
         if (toolName === "tokens_bootstrap_from_brand") {
           const { fileKey, brand } = args;
-          const modeId = "Light";
           const collectionName = "Tokens";
 
           // Step A: read local vars
@@ -373,9 +383,10 @@ export function attachMcpRoutes(app, tokenStore) {
 
           let collectionId = getFirstCollectionIdFromLocalVarsBody(before.body);
 
-          // Step B: create collection if needed
+          // Step B: create collection if missing
           let createdCollectionStep = null;
           if (!collectionId) {
+            // Create collection with a mode - Figma will assign real ids (e.g. "46:0")
             const createCollectionResp = await figmaCreateVariables({
               accessToken,
               fileKey,
@@ -384,7 +395,8 @@ export function attachMcpRoutes(app, tokenStore) {
                   {
                     action: "CREATE",
                     name: collectionName,
-                    modes: [{ modeId, name: "Light" }],
+                    // modeId string here is fine as a placeholder; real id is generated by Figma
+                    modes: [{ modeId: "Light", name: "Light" }],
                   },
                 ],
                 variables: [],
@@ -406,7 +418,7 @@ export function attachMcpRoutes(app, tokenStore) {
               });
             }
 
-            // Step C: re-read local vars to get id
+            // Re-read to get the real collection id + real mode id
             const after = await figmaGetLocalVariables({ accessToken, fileKey });
             if (!after.ok) {
               return res.json({
@@ -422,7 +434,6 @@ export function attachMcpRoutes(app, tokenStore) {
             }
 
             collectionId = getFirstCollectionIdFromLocalVarsBody(after.body);
-
             if (!collectionId) {
               return res.json({
                 jsonrpc: "2.0",
@@ -437,8 +448,41 @@ export function attachMcpRoutes(app, tokenStore) {
             }
           }
 
-          // Step D: create variables with sanitized names
-          const payload = buildVariableCreateMutationsFlat({ brand, collectionId, modeId });
+          // Step C: re-read (always) to get real modeId for this collection
+          const metaNow = await figmaGetLocalVariables({ accessToken, fileKey });
+          if (!metaNow.ok) {
+            return res.json({
+              jsonrpc: "2.0",
+              id,
+              result: textResult({
+                ok: false,
+                status: metaNow.status,
+                note: "Could not re-read variables/local to resolve modeId.",
+                responseBody: metaNow.body,
+              }),
+            });
+          }
+
+          const modeIdReal = getModeIdForCollection(metaNow.body, collectionId);
+          if (!modeIdReal) {
+            return res.json({
+              jsonrpc: "2.0",
+              id,
+              result: textResult({
+                ok: false,
+                status: 500,
+                note: "Could not resolve modeId for collection.",
+                debug: { collectionId, variablesLocal: metaNow.body },
+              }),
+            });
+          }
+
+          // Step D: create variables (use REAL modeId)
+          const payload = buildVariableCreateMutationsFlat({
+            brand,
+            collectionId,
+            modeId: modeIdReal,
+          });
 
           const createVars = await figmaCreateVariables({
             accessToken,
@@ -459,6 +503,7 @@ export function attachMcpRoutes(app, tokenStore) {
                 : "❌ Figma rejected variable creation. See responseBody.",
               debug: {
                 usedCollectionId: collectionId,
+                usedModeId: modeIdReal,
                 createdCollectionStep,
                 variablesCount: payload.variables.length,
                 sampleNames: payload.variables.slice(0, 4).map((v) => v.name),
