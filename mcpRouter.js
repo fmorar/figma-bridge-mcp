@@ -24,8 +24,6 @@ const TOOLS = [
       required: ["fileKey", "nodeIds"]
     }
   },
-
-  // ---- Vertical slice C tools ----
   {
     name: "tokens_bootstrap_from_brand",
     description: "Create primitive + semantic tokens (Figma Variables) from a brand pack (Light/Desktop).",
@@ -73,9 +71,7 @@ const TOOLS = [
 ];
 
 function textResult(obj) {
-  return {
-    content: [{ type: "text", text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2) }]
-  };
+  return { content: [{ type: "text", text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2) }] };
 }
 
 function parseAuth(req) {
@@ -191,7 +187,6 @@ function buildCssExport({ brand }) {
   return { globalsCssPreview, tokenMap };
 }
 
-// ✅ Tools that REQUIRE a Figma OAuth access_token
 const FIGMA_OAUTH_REQUIRED = new Set([
   "figma_get_file",
   "figma_get_nodes",
@@ -263,9 +258,6 @@ export function attachMcpRoutes(app, tokenStore) {
         const toolName = normalizeToolName(toolNameRaw);
         const args = params?.arguments || {};
 
-        console.log("[MCP tools/call]", { toolNameRaw, toolName });
-
-        // ✅ Only load token if this tool needs it
         let accessToken = null;
         if (FIGMA_OAUTH_REQUIRED.has(toolName)) {
           const token = await (tokenStore?.load?.() ?? null);
@@ -275,44 +267,35 @@ export function attachMcpRoutes(app, tokenStore) {
           accessToken = token.access_token;
         }
 
-        // ---- Manifest tools DO NOT require OAuth ----
+        // Manifest store tools (NO OAuth)
         if (toolName === "project_manifest_write") {
           const { fileKey, manifest } = args;
-          if (!fileKey) return jsonRpcError(res, { id, code: -32602, message: "Missing fileKey" });
-          if (!manifest) return jsonRpcError(res, { id, code: -32602, message: "Missing manifest" });
           const w = manifestStore.write({ fileKey, manifest });
           return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, ...w }) });
         }
 
         if (toolName === "project_manifest_read") {
           const { fileKey } = args;
-          if (!fileKey) return jsonRpcError(res, { id, code: -32602, message: "Missing fileKey" });
           const m = manifestStore.read({ fileKey });
           return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, manifest: m }) });
         }
 
-        // ---- Figma tools (require OAuth) ----
+        // Figma tools (OAuth required)
         if (toolName === "figma_get_file") {
           const out = await figmaGetFile({ accessToken, fileKey: args.fileKey });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
         if (toolName === "figma_get_nodes") {
-          const out = await figmaGetNodes({
-            accessToken,
-            fileKey: args.fileKey,
-            nodeIds: args.nodeIds
-          });
+          const out = await figmaGetNodes({ accessToken, fileKey: args.fileKey, nodeIds: args.nodeIds });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
         if (toolName === "tokens_bootstrap_from_brand") {
-          const { fileKey, brand } = args;
-          const payload = buildVariablesPayload({ brand });
-
+          const payload = buildVariablesPayload({ brand: args.brand });
           const out = await figmaCreateVariables({
             accessToken,
-            fileKey,
+            fileKey: args.fileKey,
             payload: { variables: payload.variables }
           });
 
@@ -329,9 +312,7 @@ export function attachMcpRoutes(app, tokenStore) {
         }
 
         if (toolName === "tokens_export_map") {
-          const { fileKey } = args;
-          const vars = await figmaGetLocalVariables({ accessToken, fileKey });
-
+          const vars = await figmaGetLocalVariables({ accessToken, fileKey: args.fileKey });
           return res.json({
             jsonrpc: "2.0",
             id,
