@@ -35,10 +35,7 @@ const TOOLS = [
         fileKey: { type: "string" },
         brand: {
           type: "object",
-          properties: {
-            colors: { type: "object" },
-            typography: { type: "object" }
-          },
+          properties: { colors: { type: "object" }, typography: { type: "object" } },
           required: ["colors", "typography"]
         },
         mode: { type: "string", enum: ["Light"], default: "Light" }
@@ -60,10 +57,7 @@ const TOOLS = [
     description: "Write project manifest snapshot (phase=ds) to server-side store.",
     inputSchema: {
       type: "object",
-      properties: {
-        fileKey: { type: "string" },
-        manifest: { type: "object" }
-      },
+      properties: { fileKey: { type: "string" }, manifest: { type: "object" } },
       required: ["fileKey", "manifest"]
     }
   },
@@ -85,23 +79,16 @@ function textResult(obj) {
 }
 
 function parseAuth(req) {
-  // Supports:
-  // - Authorization: Bearer <key>
-  // - ?authKey=<key>
-  // - x-mcp-auth: <key>
   const h = (req.get("authorization") || "").trim();
   const m = h.match(/^Bearer\s+(.+)$/i);
   const bearer = m?.[1]?.trim();
-
   const q = (req.query?.authKey || "").toString().trim();
   const x = (req.get("x-mcp-auth") || "").toString().trim();
-
   return bearer || q || x || null;
 }
 
 function attachAuth({ sharedKey }) {
   return function authorized(req) {
-    // If no key configured, run open (useful for local dev)
     if (!sharedKey) return true;
     const key = parseAuth(req);
     return Boolean(key && key === sharedKey);
@@ -127,7 +114,6 @@ function startSSE(req, res) {
 
 function normalizeToolName(name) {
   if (!name || typeof name !== "string") return name;
-  // Some agent platforms prefix tool names (e.g., "a_tokens_bootstrap_from_brand")
   if (name.startsWith("a_")) return name.slice(2);
   return name;
 }
@@ -205,11 +191,18 @@ function buildCssExport({ brand }) {
   return { globalsCssPreview, tokenMap };
 }
 
+// ✅ Tools that REQUIRE a Figma OAuth access_token
+const FIGMA_OAUTH_REQUIRED = new Set([
+  "figma_get_file",
+  "figma_get_nodes",
+  "tokens_bootstrap_from_brand",
+  "tokens_export_map"
+]);
+
 export function attachMcpRoutes(app, tokenStore) {
   const authorized = attachAuth({ sharedKey: process.env.MCP_AUTH_KEY });
   const manifestStore = createManifestStore({ dir: process.env.MANIFEST_STORE_DIR || ".data/manifests" });
 
-  // /mcp can return JSON tools OR open an SSE stream depending on Accept header
   app.get("/mcp", (req, res) => {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     const accept = (req.get("accept") || "").toLowerCase();
@@ -217,13 +210,11 @@ export function attachMcpRoutes(app, tokenStore) {
     return startSSE(req, res);
   });
 
-  // Force SSE content-type for strict clients
   app.get("/mcp/sse", (req, res) => {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     return startSSE(req, res);
   });
 
-  // Tools listing compatibility
   function toolsCompat(req, res) {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     return res.json({ tools: TOOLS });
@@ -237,7 +228,6 @@ export function attachMcpRoutes(app, tokenStore) {
     const body = req.body || {};
     const { jsonrpc, id, method, params } = body;
 
-    // ✅ Always reply JSON-RPC for unauthorized POSTs (prevents "no result")
     if (!authorized(req)) {
       return jsonRpcError(res, {
         id,
@@ -273,45 +263,55 @@ export function attachMcpRoutes(app, tokenStore) {
         const toolName = normalizeToolName(toolNameRaw);
         const args = params?.arguments || {};
 
-        console.log("[MCP tools/call]", {
-          toolNameRaw,
-          toolName,
-          fileKey: args?.fileKey,
-          authProvided: Boolean(parseAuth(req))
-        });
+        console.log("[MCP tools/call]", { toolNameRaw, toolName });
 
-        // tokenStore may be sync or async; await works either way
-        const token = await (tokenStore?.load?.() ?? null);
-
-        if (!token?.access_token) {
-          return jsonRpcError(res, { id, code: 401, message: "OAuth required: open /auth/figma/login first" });
+        // ✅ Only load token if this tool needs it
+        let accessToken = null;
+        if (FIGMA_OAUTH_REQUIRED.has(toolName)) {
+          const token = await (tokenStore?.load?.() ?? null);
+          if (!token?.access_token) {
+            return jsonRpcError(res, { id, code: 401, message: "OAuth required: open /auth/figma/login first" });
+          }
+          accessToken = token.access_token;
         }
 
-        // Existing tools
+        // ---- Manifest tools DO NOT require OAuth ----
+        if (toolName === "project_manifest_write") {
+          const { fileKey, manifest } = args;
+          if (!fileKey) return jsonRpcError(res, { id, code: -32602, message: "Missing fileKey" });
+          if (!manifest) return jsonRpcError(res, { id, code: -32602, message: "Missing manifest" });
+          const w = manifestStore.write({ fileKey, manifest });
+          return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, ...w }) });
+        }
+
+        if (toolName === "project_manifest_read") {
+          const { fileKey } = args;
+          if (!fileKey) return jsonRpcError(res, { id, code: -32602, message: "Missing fileKey" });
+          const m = manifestStore.read({ fileKey });
+          return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, manifest: m }) });
+        }
+
+        // ---- Figma tools (require OAuth) ----
         if (toolName === "figma_get_file") {
-          const out = await figmaGetFile({ accessToken: token.access_token, fileKey: args.fileKey });
+          const out = await figmaGetFile({ accessToken, fileKey: args.fileKey });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
         if (toolName === "figma_get_nodes") {
           const out = await figmaGetNodes({
-            accessToken: token.access_token,
+            accessToken,
             fileKey: args.fileKey,
             nodeIds: args.nodeIds
           });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
-        // Slice C: bootstrap tokens
         if (toolName === "tokens_bootstrap_from_brand") {
           const { fileKey, brand } = args;
-          if (!fileKey) return jsonRpcError(res, { id, code: -32602, message: "Missing fileKey" });
-          if (!brand?.colors) return jsonRpcError(res, { id, code: -32602, message: "Missing brand.colors" });
-
           const payload = buildVariablesPayload({ brand });
 
           const out = await figmaCreateVariables({
-            accessToken: token.access_token,
+            accessToken,
             fileKey,
             payload: { variables: payload.variables }
           });
@@ -328,12 +328,9 @@ export function attachMcpRoutes(app, tokenStore) {
           });
         }
 
-        // Slice C: export tokens
         if (toolName === "tokens_export_map") {
           const { fileKey } = args;
-          if (!fileKey) return jsonRpcError(res, { id, code: -32602, message: "Missing fileKey" });
-
-          const vars = await figmaGetLocalVariables({ accessToken: token.access_token, fileKey });
+          const vars = await figmaGetLocalVariables({ accessToken, fileKey });
 
           return res.json({
             jsonrpc: "2.0",
@@ -345,24 +342,6 @@ export function attachMcpRoutes(app, tokenStore) {
               export: buildCssExport({ brand: args.brand || { colors: {}, typography: {} } })
             })
           });
-        }
-
-        // Manifest store
-        if (toolName === "project_manifest_write") {
-          const { fileKey, manifest } = args;
-          if (!fileKey) return jsonRpcError(res, { id, code: -32602, message: "Missing fileKey" });
-          if (!manifest) return jsonRpcError(res, { id, code: -32602, message: "Missing manifest" });
-
-          const w = manifestStore.write({ fileKey, manifest });
-          return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, ...w }) });
-        }
-
-        if (toolName === "project_manifest_read") {
-          const { fileKey } = args;
-          if (!fileKey) return jsonRpcError(res, { id, code: -32602, message: "Missing fileKey" });
-
-          const m = manifestStore.read({ fileKey });
-          return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, manifest: m }) });
         }
 
         return jsonRpcError(res, { id, code: -32601, message: `Unknown tool: ${toolNameRaw}` });
@@ -380,7 +359,6 @@ export function attachMcpRoutes(app, tokenStore) {
     }
   }
 
-  // JSON-RPC endpoints
   app.post("/mcp", handleRpc);
   app.post("/mcp/sse", handleRpc);
 }
