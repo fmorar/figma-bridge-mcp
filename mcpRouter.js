@@ -29,8 +29,6 @@ const TOOLS = [
       required: ["fileKey", "nodeIds"],
     },
   },
-
-  // ---- Vertical slice C tools ----
   {
     name: "tokens_bootstrap_from_brand",
     description:
@@ -174,9 +172,12 @@ function buildCssExport({ brand }) {
 }
 
 /**
- * Build variable CREATE mutations (Figma expects discriminator action)
+ * IMPORTANT:
+ * Your Figma endpoint expects the FLAT schema:
+ * variables[i].action + variables[i].name + variables[i].variableCollectionId + variables[i].resolvedType + valuesByMode
+ * (NOT nested under variable: { ... })
  */
-function buildVariableCreateMutations({ brand, collectionId, modeId = "Light" }) {
+function buildVariableCreateMutationsFlat({ brand, collectionId, modeId = "Light" }) {
   const { colors, typography } = brand;
 
   const prim = {
@@ -197,19 +198,50 @@ function buildVariableCreateMutations({ brand, collectionId, modeId = "Light" })
 
   for (const [name, hex] of Object.entries({ ...prim, ...sem })) {
     const rgba = hexToRgba01(hex) || hexToRgba01("#000000");
-
     variables.push({
       action: "CREATE",
-      variable: {
-        name,
-        resolvedType: "COLOR",
-        variableCollectionId: collectionId,
-        valuesByMode: { [modeId]: rgba },
-      },
+      name,
+      resolvedType: "COLOR",
+      variableCollectionId: collectionId,
+      valuesByMode: { [modeId]: rgba },
     });
   }
 
   return { variables, typography };
+}
+
+/**
+ * Extract a collectionId from the create variables response.
+ * We don't assume exact shape; we try a few likely spots.
+ */
+function extractFirstCollectionId(body) {
+  const metaCollections = body?.meta?.variableCollections;
+  if (metaCollections && typeof metaCollections === "object") {
+    const list = Object.values(metaCollections);
+    const found = list.find((c) => c?.id);
+    if (found?.id) return found.id;
+  }
+
+  const directCollections = body?.variableCollections;
+  if (Array.isArray(directCollections)) {
+    const found = directCollections.find((c) => c?.id);
+    if (found?.id) return found.id;
+  }
+  if (directCollections && typeof directCollections === "object") {
+    const list = Object.values(directCollections);
+    const found = list.find((c) => c?.id);
+    if (found?.id) return found.id;
+  }
+
+  // sometimes APIs return created entities under "created" / "result"
+  const created = body?.created?.variableCollections;
+  if (created && typeof created === "object") {
+    const list = Object.values(created);
+    const found = list.find((c) => c?.id);
+    if (found?.id) return found.id;
+  }
+
+  return null;
 }
 
 const FIGMA_OAUTH_REQUIRED = new Set([
@@ -225,7 +257,6 @@ export function attachMcpRoutes(app, tokenStore) {
     dir: process.env.MANIFEST_STORE_DIR || ".data/manifests",
   });
 
-  // /mcp can return JSON tools OR open an SSE stream depending on Accept header
   app.get("/mcp", (req, res) => {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     const accept = (req.get("accept") || "").toLowerCase();
@@ -233,7 +264,6 @@ export function attachMcpRoutes(app, tokenStore) {
     return startSSE(req, res);
   });
 
-  // Force SSE content-type for strict clients
   app.get("/mcp/sse", (req, res) => {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     return startSSE(req, res);
@@ -287,7 +317,6 @@ export function attachMcpRoutes(app, tokenStore) {
         const toolName = normalizeToolName(toolNameRaw);
         const args = params?.arguments || {};
 
-        // Load OAuth token only for Figma tools
         let accessToken = null;
         if (FIGMA_OAUTH_REQUIRED.has(toolName)) {
           const token = await (tokenStore?.load?.() ?? null);
@@ -314,27 +343,23 @@ export function attachMcpRoutes(app, tokenStore) {
           return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, manifest: m }) });
         }
 
-        // ---- Figma tools (OAuth required) ----
+        // ---- Figma tools ----
         if (toolName === "figma_get_file") {
-          const out = await figmaGetFile({ accessToken: accessToken, fileKey: args.fileKey });
+          const out = await figmaGetFile({ accessToken, fileKey: args.fileKey });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
         if (toolName === "figma_get_nodes") {
           const out = await figmaGetNodes({
-            accessToken: accessToken,
+            accessToken,
             fileKey: args.fileKey,
             nodeIds: args.nodeIds,
           });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
-        // ---- Slice C: export map ----
         if (toolName === "tokens_export_map") {
-          const vars = await figmaGetLocalVariables({
-            accessToken: accessToken,
-            fileKey: args.fileKey,
-          });
+          const vars = await figmaGetLocalVariables({ accessToken, fileKey: args.fileKey });
 
           return res.json({
             jsonrpc: "2.0",
@@ -348,12 +373,14 @@ export function attachMcpRoutes(app, tokenStore) {
           });
         }
 
-        // ---- Slice C: bootstrap tokens (create variables) ----
+        // ---- FIXED: bootstrap tokens ----
         if (toolName === "tokens_bootstrap_from_brand") {
           const { fileKey, brand } = args;
+          const modeId = "Light";
+          const collectionName = "Tokens";
 
-          // 1) Read local vars metadata to check collections
-          const varsMeta = await figmaGetLocalVariables({ accessToken: accessToken, fileKey });
+          // 1) Read local vars to see if any collection exists
+          const varsMeta = await figmaGetLocalVariables({ accessToken, fileKey });
 
           if (!varsMeta.ok) {
             return res.json({
@@ -370,62 +397,93 @@ export function attachMcpRoutes(app, tokenStore) {
 
           const collectionsObj = varsMeta.body?.meta?.variableCollections || {};
           const collectionList = Object.values(collectionsObj);
-          const hasAnyCollection = collectionList.length > 0;
+          let collectionId = collectionList.find((c) => c?.id)?.id || null;
 
-          const collectionName = "Tokens";
-          const modeId = "Light";
+          // 2) If no collection exists, create one (FLAT schema)
+          let createdCollectionResponse = null;
+          if (!collectionId) {
+            const createCollection = await figmaCreateVariables({
+              accessToken,
+              fileKey,
+              payload: {
+                variableCollections: [
+                  {
+                    action: "CREATE",
+                    name: collectionName, // ✅ required at variableCollections.0.name
+                    modes: [{ modeId, name: "Light" }],
+                  },
+                ],
+                variables: [],
+              },
+            });
 
-          // If collection exists, use its id
-          // If not, we'll create one with tempId tokens_collection
-          const existingCollectionId = hasAnyCollection ? collectionList[0]?.id : null;
-          const targetCollectionId = hasAnyCollection ? existingCollectionId : "tokens_collection";
+            createdCollectionResponse = createCollection;
 
-          const payload = buildVariableCreateMutations({
+            if (!createCollection.ok) {
+              return res.json({
+                jsonrpc: "2.0",
+                id,
+                result: textResult({
+                  ok: false,
+                  status: createCollection.status,
+                  note: "Failed to create variable collection.",
+                  responseBody: createCollection.body,
+                }),
+              });
+            }
+
+            collectionId = extractFirstCollectionId(createCollection.body);
+
+            if (!collectionId) {
+              // We created it but can't find its id in the response shape.
+              // Return debug so we can adjust extractor if needed.
+              return res.json({
+                jsonrpc: "2.0",
+                id,
+                result: textResult({
+                  ok: false,
+                  status: 500,
+                  note:
+                    "Created collection but could not extract collectionId from response. Paste responseBody to adjust extractor.",
+                  responseBody: createCollection.body,
+                }),
+              });
+            }
+          }
+
+          // 3) Create variables (FLAT schema)
+          const payload = buildVariableCreateMutationsFlat({
             brand,
-            collectionId: targetCollectionId,
+            collectionId, // ✅ required at variables[i].variableCollectionId
             modeId,
           });
 
-          const requestBody = {
-            variableCollections: hasAnyCollection
-              ? []
-              : [
-                  {
-                    action: "CREATE",
-                    tempId: "tokens_collection",
-                    variableCollection: {
-                      name: collectionName,
-                      modes: [{ modeId, name: "Light" }],
-                    },
-                  },
-                ],
-            variables: payload.variables,
-          };
-
-          const out = await figmaCreateVariables({
-            accessToken: accessToken,
+          const createVars = await figmaCreateVariables({
+            accessToken,
             fileKey,
-            payload: requestBody,
+            payload: {
+              variableCollections: [],
+              variables: payload.variables,
+            },
           });
 
           return res.json({
             jsonrpc: "2.0",
             id,
             result: textResult({
-              ok: out.ok,
-              status: out.status,
-              responseBody: out.body,
+              ok: createVars.ok,
+              status: createVars.status,
+              responseBody: createVars.body,
               typography: payload.typography,
-              note: out.ok
+              note: createVars.ok
                 ? "✅ Variables created (or accepted) by Figma."
                 : "❌ Figma rejected variable creation. See responseBody.",
               debug: {
-                hadExistingCollection: hasAnyCollection,
-                usedCollectionId: targetCollectionId,
-                requestShape: {
-                  variableCollectionsCount: requestBody.variableCollections.length,
-                  variablesCount: requestBody.variables.length,
-                },
+                usedCollectionId: collectionId,
+                createdCollectionStep: createdCollectionResponse
+                  ? { ok: createdCollectionResponse.ok, status: createdCollectionResponse.status }
+                  : null,
+                variablesCount: payload.variables.length,
               },
             }),
           });
