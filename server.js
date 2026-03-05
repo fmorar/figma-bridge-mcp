@@ -73,7 +73,7 @@ app.get("/auth/figma/login", (req, res) => {
   // Scopes: start with read-only. Add write if you want to create variables.
   // If variables creation requires write scopes, upgrade later.
   // Many devs use: "file_read file_write"
-  url.searchParams.set("scope", "file_read file_write");
+  url.searchParams.set("scope", "file_read");
   url.searchParams.set("response_type", "code");
   url.searchParams.set("state", state);
 
