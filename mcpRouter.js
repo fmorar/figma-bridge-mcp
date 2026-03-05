@@ -38,10 +38,7 @@ const TOOLS = [
         fileKey: { type: "string" },
         brand: {
           type: "object",
-          properties: {
-            colors: { type: "object" },
-            typography: { type: "object" }
-          },
+          properties: { colors: { type: "object" }, typography: { type: "object" } },
           required: ["colors", "typography"]
         },
         mode: { type: "string", enum: ["Light"], default: "Light" }
@@ -51,7 +48,7 @@ const TOOLS = [
   },
   {
     name: "tokens_export_map",
-    description: "Export tokens as CSS variables + token map.",
+    description: "Export tokens as CSS variables (globals.css snippet) + token map.",
     inputSchema: {
       type: "object",
       properties: { fileKey: { type: "string" } },
@@ -85,7 +82,7 @@ function textResult(obj) {
 }
 
 function parseAuth(req) {
-  const h = (req.get("authorization") || "").trim();
+  const h = req.get("authorization") || "";
   const m = h.match(/^Bearer\s+(.+)$/i);
   const bearer = m?.[1]?.trim();
   const q = (req.query?.authKey || "").toString().trim();
@@ -95,6 +92,7 @@ function parseAuth(req) {
 
 function attachAuth({ sharedKey }) {
   return function authorized(req) {
+    // si no hay key configurada, no bloquees
     if (!sharedKey) return true;
     const key = parseAuth(req);
     return Boolean(key && key === sharedKey);
@@ -124,14 +122,6 @@ function normalizeToolName(name) {
   return name;
 }
 
-function jsonRpcError(res, { id, code, message, data }) {
-  return res.status(200).json({
-    jsonrpc: "2.0",
-    id: id ?? null,
-    error: { code, message, ...(data ? { data } : {}) }
-  });
-}
-
 function hexToRgba01(hex) {
   const h = (hex || "").replace("#", "").trim();
   const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
@@ -140,6 +130,14 @@ function hexToRgba01(hex) {
   const g = parseInt(full.slice(2, 4), 16) / 255;
   const b = parseInt(full.slice(4, 6), 16) / 255;
   return { r, g, b, a: 1 };
+}
+
+function normalizeVarName(name) {
+  // Figma variables: evita "." (te dio error antes). Slash funciona perfecto.
+  return String(name || "")
+    .trim()
+    .replace(/\.+/g, "/")
+    .replace(/\/+/g, "/");
 }
 
 function buildCssExport({ brand }) {
@@ -167,121 +165,146 @@ function buildCssExport({ brand }) {
   return { globalsCssPreview, tokenMap };
 }
 
-function sanitizeVarName(name) {
-  return String(name || "")
-    .trim()
-    .replace(/\.+/g, "/") // "." -> "/"
-    .replace(/\/{2,}/g, "/")
-    .replace(/^\//, "")
-    .replace(/\/$/, "");
+function extractMeta(body) {
+  // Soporta diferentes wrappers según tu figmaApi.js
+  // body puede venir como: {status,error,meta:{...}} o {meta:{...}} o {body:{meta:{...}}}
+  if (!body) return null;
+  if (body.meta) return body.meta;
+  if (body.body?.meta) return body.body.meta;
+  if (body.data?.meta) return body.data.meta;
+  return null;
 }
 
-function getCollections(metaBody) {
-  return metaBody?.meta?.variableCollections || {};
+function pickTokensCollection(meta, preferName = "Tokens") {
+  const collections = meta?.variableCollections || {};
+  const vars = meta?.variables || {};
+
+  const list = Object.values(collections).map((c) => {
+    const count = Array.isArray(c.variableIds) ? c.variableIds.length : 0;
+    return { ...c, _count: count };
+  });
+
+  const candidates = list.filter((c) => (c.name || "").trim() === preferName);
+
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  // si hay varias “Tokens”, elige la que tenga más variables
+  candidates.sort((a, b) => (b._count || 0) - (a._count || 0));
+  return candidates[0];
 }
 
-function getVariables(metaBody) {
-  return metaBody?.meta?.variables || {};
+async function ensureTokensCollection({ accessToken, fileKey, modeName = "Light" }) {
+  // 1) lee variables existentes para hallar la colección
+  const existing = await figmaGetLocalVariables({ accessToken, fileKey });
+  const meta = extractMeta(existing?.body);
+  const picked = pickTokensCollection(meta, "Tokens");
+
+  if (picked?.id && picked?.defaultModeId) {
+    return {
+      ok: true,
+      created: false,
+      collectionId: picked.id,
+      modeId: picked.defaultModeId,
+      seenCollections: Object.values(meta?.variableCollections || {}).map((c) => ({
+        id: c.id,
+        name: c.name,
+        variableCount: Array.isArray(c.variableIds) ? c.variableIds.length : 0,
+        defaultModeId: c.defaultModeId
+      }))
+    };
+  }
+
+  // 2) no existe: créala (solo colección)
+  // IMPORTANT: Figma usa ids temporales en writes.
+  const tempCollectionId = "tokens_collection";
+  const tempModeId = "mode_light";
+
+  const createOut = await figmaCreateVariables({
+    accessToken,
+    fileKey,
+    payload: {
+      variableCollections: [
+        {
+          action: "CREATE",
+          id: tempCollectionId,
+          name: "Tokens",
+          modes: [{ action: "CREATE", modeId: tempModeId, name: modeName }]
+        }
+      ],
+      variables: []
+    }
+  });
+
+  // 3) después de crear, vuelve a leer para obtener ids reales (lo más estable)
+  const after = await figmaGetLocalVariables({ accessToken, fileKey });
+  const afterMeta = extractMeta(after?.body);
+  const afterPicked = pickTokensCollection(afterMeta, "Tokens");
+
+  if (!afterPicked?.id || !afterPicked?.defaultModeId) {
+    return {
+      ok: false,
+      created: true,
+      status: createOut?.status,
+      responseBody: createOut?.body,
+      note: "Created collection but could not resolve collectionId/defaultModeId from subsequent read."
+    };
+  }
+
+  return {
+    ok: true,
+    created: true,
+    collectionId: afterPicked.id,
+    modeId: afterPicked.defaultModeId,
+    createdCollectionStep: { ok: createOut?.ok, status: createOut?.status, body: createOut?.body }
+  };
 }
 
-// ✅ if multiple "Tokens" collections exist, pick the one with the MOST variables
-function pickTokensCollection(metaBody, desiredName = "Tokens") {
-  const collections = Object.values(getCollections(metaBody));
-  const matches = collections.filter((c) => c?.name === desiredName);
-
-  if (matches.length === 0) return null;
-
-  matches.sort((a, b) => (b?.variableIds?.length || 0) - (a?.variableIds?.length || 0));
-  return matches[0];
-}
-
-function getModeIdForCollection(collection) {
-  return collection?.defaultModeId || collection?.modes?.[0]?.modeId || null;
-}
-
-function findExistingVariableId(metaBody, collectionId, name) {
-  const vars = Object.values(getVariables(metaBody));
-  const hit = vars.find(
-    (v) => v?.variableCollectionId === collectionId && v?.name === name
-  );
-  return hit?.id || null;
-}
-
-function buildBrandTokenSpecs(brand) {
-  const { colors, typography } = brand;
+function buildTokenSpec({ brand }) {
+  const { colors, typography } = brand || {};
+  const c = colors || {};
 
   const prim = {
-    "color.primary": colors?.primary,
-    "color.accent": colors?.accent,
-    "color.neutral.900": colors?.neutral || "#111827",
-    "color.background": colors?.background || "#FFFFFF"
+    "color/primary": c.primary || "#1E40AF",
+    "color/accent": c.accent || "#F59E0B",
+    "color/neutral/900": c.neutral || "#111827",
+    "color/background": c.background || "#FFFFFF"
   };
 
   const sem = {
-    "semantic.bg": prim["color.background"],
-    "semantic.fg": prim["color.neutral.900"],
-    "semantic.brand": prim["color.primary"],
-    "semantic.accent": prim["color.accent"]
+    "semantic/bg": prim["color/background"],
+    "semantic/fg": prim["color/neutral/900"],
+    "semantic/brand": prim["color/primary"],
+    "semantic/accent": prim["color/accent"]
   };
 
-  return { prim, sem, typography };
+  const merged = { ...prim, ...sem };
+
+  return {
+    typography: typography || {},
+    tokens: Object.entries(merged).map(([name, hex]) => ({
+      name: normalizeVarName(name),
+      hex: hex || "#000000",
+      rgba: hexToRgba01(hex) || hexToRgba01("#000000")
+    }))
+  };
 }
-
-// ✅ Create or UPDATE (idempotent), using real modeId
-function buildVariableMutations({ brand, collectionId, modeId, metaBody }) {
-  const { prim, sem, typography } = buildBrandTokenSpecs(brand);
-  const all = { ...prim, ...sem };
-
-  const variables = [];
-  const planned = [];
-  const computedSample = [];
-
-  for (const [rawName, hex] of Object.entries(all)) {
-    const name = sanitizeVarName(rawName);
-    const rgba = hexToRgba01(hex) || hexToRgba01("#000000");
-
-    const existingId = findExistingVariableId(metaBody, collectionId, name);
-
-    if (computedSample.length < 4) {
-      computedSample.push({ name, hex, rgba, existingId: existingId || null, modeId });
-    }
-
-    if (existingId) {
-      variables.push({
-        action: "UPDATE",
-        id: existingId,
-        name,
-        variableCollectionId: collectionId,
-        resolvedType: "COLOR",
-        valuesByMode: { [modeId]: rgba }
-      });
-      planned.push({ name, action: "UPDATE", id: existingId });
-    } else {
-      variables.push({
-        action: "CREATE",
-        name,
-        variableCollectionId: collectionId,
-        resolvedType: "COLOR",
-        valuesByMode: { [modeId]: rgba }
-      });
-      planned.push({ name, action: "CREATE" });
-    }
-  }
-
-  return { variables, typography, planned, computedSample };
-}
-
-const FIGMA_OAUTH_REQUIRED = new Set([
-  "figma_get_file",
-  "figma_get_nodes",
-  "tokens_bootstrap_from_brand",
-  "tokens_export_map"
-]);
 
 export function attachMcpRoutes(app, tokenStore) {
   const authorized = attachAuth({ sharedKey: process.env.MCP_AUTH_KEY });
   const manifestStore = createManifestStore({ dir: process.env.MANIFEST_STORE_DIR || ".data/manifests" });
 
+  // Health / index (opcional, útil para "Cannot GET /")
+  app.get("/", (_req, res) => {
+    res.json({
+      ok: true,
+      service: "figma-bridge-mcp",
+      baseUrl: process.env.PUBLIC_BASE_URL || "",
+      endpoints: ["/mcp", "/mcp/tools", "/mcp/sse", "/auth/figma/login", "/auth/figma/callback"]
+    });
+  });
+
+  // /mcp can return JSON tools OR open an SSE stream depending on Accept header
   app.get("/mcp", (req, res) => {
     if (!authorized(req)) return res.status(401).send("Unauthorized");
     const accept = (req.get("accept") || "").toLowerCase();
@@ -304,249 +327,199 @@ export function attachMcpRoutes(app, tokenStore) {
   app.post("/mcp/sse/tools", toolsCompat);
 
   async function handleRpc(req, res) {
+    if (!authorized(req)) return res.status(401).send("Unauthorized");
+
     const body = req.body || {};
     const { jsonrpc, id, method, params } = body;
 
-    if (!authorized(req)) {
-      return jsonRpcError(res, {
-        id,
-        code: 401,
-        message: "Unauthorized: invalid MCP_AUTH_KEY"
+    if (jsonrpc !== "2.0" || !method) {
+      return res.status(400).json({
+        jsonrpc: "2.0",
+        id: id ?? null,
+        error: { code: -32600, message: "Invalid Request" }
       });
     }
 
-    try {
-      if (jsonrpc !== "2.0" || !method) {
-        return jsonRpcError(res, { id, code: -32600, message: "Invalid Request" });
-      }
+    if (method === "initialize") {
+      return res.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2025-03-26",
+          serverInfo: { name: "figma-bridge-mcp", version: "1.2.0" },
+          capabilities: { tools: {} }
+        }
+      });
+    }
 
-      if (method === "initialize") {
+    if (method === "tools/list") {
+      return res.json({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
+    }
+
+    if (method === "tools/call") {
+      const token = tokenStore.load?.() || tokenStore.get?.() || tokenStore.token?.();
+      if (!token?.access_token) {
         return res.json({
           jsonrpc: "2.0",
           id,
-          result: {
-            protocolVersion: "2025-03-26",
-            serverInfo: { name: "figma-bridge-mcp", version: "1.1.0" },
-            capabilities: { tools: {} }
-          }
+          error: { code: 401, message: "OAuth required: open /auth/figma/login first" }
         });
       }
 
-      if (method === "tools/list") {
-        return res.json({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
+      const toolNameRaw = params?.name;
+      const toolName = normalizeToolName(toolNameRaw);
+      const args = params?.arguments || {};
+
+      // --- figma_get_file ---
+      if (toolName === "figma_get_file") {
+        const out = await figmaGetFile({ accessToken: token.access_token, fileKey: args.fileKey });
+        return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
       }
 
-      if (method === "tools/call") {
-        const toolNameRaw = params?.name;
-        const toolName = normalizeToolName(toolNameRaw);
-        const args = params?.arguments || {};
+      // --- figma_get_nodes ---
+      if (toolName === "figma_get_nodes") {
+        const out = await figmaGetNodes({
+          accessToken: token.access_token,
+          fileKey: args.fileKey,
+          nodeIds: args.nodeIds
+        });
+        return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
+      }
 
-        let accessToken = null;
-        if (FIGMA_OAUTH_REQUIRED.has(toolName)) {
-          const token = await (tokenStore?.load?.() ?? null);
-          if (!token?.access_token) {
-            return jsonRpcError(res, { id, code: 401, message: "OAuth required: open /auth/figma/login first" });
-          }
-          accessToken = token.access_token;
-        }
+      // --- tokens_bootstrap_from_brand ---
+      if (toolName === "tokens_bootstrap_from_brand") {
+        const { fileKey, brand, mode } = args;
+        const spec = buildTokenSpec({ brand });
 
-        // Manifest tools (no OAuth)
-        if (toolName === "project_manifest_write") {
-          const { fileKey, manifest } = args;
-          const w = manifestStore.write({ fileKey, manifest });
-          return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, ...w }) });
-        }
+        // 1) asegúrate de tener collectionId + modeId REAL
+        const ensured = await ensureTokensCollection({
+          accessToken: token.access_token,
+          fileKey,
+          modeName: mode || "Light"
+        });
 
-        if (toolName === "project_manifest_read") {
-          const { fileKey } = args;
-          const m = manifestStore.read({ fileKey });
-          return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, manifest: m }) });
-        }
-
-        // Figma tools
-        if (toolName === "figma_get_file") {
-          const out = await figmaGetFile({ accessToken, fileKey: args.fileKey });
-          return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
-        }
-
-        if (toolName === "figma_get_nodes") {
-          const out = await figmaGetNodes({ accessToken, fileKey: args.fileKey, nodeIds: args.nodeIds });
-          return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
-        }
-
-        if (toolName === "tokens_export_map") {
-          const vars = await figmaGetLocalVariables({ accessToken, fileKey: args.fileKey });
+        if (!ensured.ok) {
           return res.json({
             jsonrpc: "2.0",
             id,
             result: textResult({
-              localVariablesStatus: vars.status,
-              localVariablesOk: vars.ok,
-              localVariablesBody: vars.body,
-              export: buildCssExport({ brand: args.brand || { colors: {}, typography: {} } })
+              ok: false,
+              status: ensured.status || 500,
+              note: ensured.note || "Could not ensure Tokens collection",
+              responseBody: ensured.responseBody,
+              debug: ensured
             })
           });
         }
 
-        // ✅ Bootstrap (idempotent)
-        if (toolName === "tokens_bootstrap_from_brand") {
-          const { fileKey, brand } = args;
+        const collectionId = ensured.collectionId;
+        const modeId = ensured.modeId;
 
-          // Read meta
-          const meta1 = await figmaGetLocalVariables({ accessToken, fileKey });
-          if (!meta1.ok) {
-            return res.json({
-              jsonrpc: "2.0",
-              id,
-              result: textResult({
-                ok: false,
-                status: meta1.status,
-                note: "Failed to read variables/local",
-                responseBody: meta1.body
-              })
-            });
+        // 2) lee variables para ver si existen (para UPDATE)
+        const local = await figmaGetLocalVariables({ accessToken: token.access_token, fileKey });
+        const meta = extractMeta(local?.body);
+        const variables = meta?.variables || {};
+
+        const existingByName = new Map();
+        for (const v of Object.values(variables)) {
+          if (v?.name && v?.variableCollectionId === collectionId) {
+            existingByName.set(v.name, v);
           }
-
-          // Pick existing Tokens collection (prefer the one with most variables)
-          let tokensCollection = pickTokensCollection(meta1.body, "Tokens");
-
-          // Only create if truly missing
-          let createdCollectionStep = null;
-          if (!tokensCollection) {
-            const created = await figmaCreateVariables({
-              accessToken,
-              fileKey,
-              payload: {
-                variableCollections: [
-                  { action: "CREATE", name: "Tokens", modes: [{ modeId: "Light", name: "Light" }] }
-                ],
-                variables: []
-              }
-            });
-
-            createdCollectionStep = { ok: created.ok, status: created.status, body: created.body };
-
-            if (!created.ok) {
-              return res.json({
-                jsonrpc: "2.0",
-                id,
-                result: textResult({
-                  ok: false,
-                  status: created.status,
-                  note: "Failed to create Tokens collection",
-                  responseBody: created.body
-                })
-              });
-            }
-
-            const meta2 = await figmaGetLocalVariables({ accessToken, fileKey });
-            if (!meta2.ok) {
-              return res.json({
-                jsonrpc: "2.0",
-                id,
-                result: textResult({
-                  ok: false,
-                  status: meta2.status,
-                  note: "Created collection but could not re-read variables/local",
-                  responseBody: meta2.body
-                })
-              });
-            }
-
-            tokensCollection = pickTokensCollection(meta2.body, "Tokens");
-            if (!tokensCollection) {
-              return res.json({
-                jsonrpc: "2.0",
-                id,
-                result: textResult({
-                  ok: false,
-                  status: 500,
-                  note: "Created collection but still cannot find Tokens by name",
-                  debug: { variablesLocal: meta2.body }
-                })
-              });
-            }
-          }
-
-          const collectionId = tokensCollection.id;
-          const modeId = getModeIdForCollection(tokensCollection);
-
-          if (!modeId) {
-            return res.json({
-              jsonrpc: "2.0",
-              id,
-              result: textResult({
-                ok: false,
-                status: 500,
-                note: "Could not resolve modeId for Tokens collection",
-                debug: { tokensCollection }
-              })
-            });
-          }
-
-          // Fresh meta for updates
-          const metaNow = await figmaGetLocalVariables({ accessToken, fileKey });
-          if (!metaNow.ok) {
-            return res.json({
-              jsonrpc: "2.0",
-              id,
-              result: textResult({
-                ok: false,
-                status: metaNow.status,
-                note: "Could not re-read variables/local before write",
-                responseBody: metaNow.body
-              })
-            });
-          }
-
-          const payload = buildVariableMutations({
-            brand,
-            collectionId,
-            modeId,
-            metaBody: metaNow.body
-          });
-
-          const write = await figmaCreateVariables({
-            accessToken,
-            fileKey,
-            payload: { variableCollections: [], variables: payload.variables }
-          });
-
-          return res.json({
-            jsonrpc: "2.0",
-            id,
-            result: textResult({
-              ok: write.ok,
-              status: write.status,
-              responseBody: write.body,
-              typography: payload.typography,
-              note: write.ok ? "✅ Variables created/updated in Figma." : "❌ Figma rejected variable write.",
-              debug: {
-                usedCollectionId: collectionId,
-                usedModeId: modeId,
-                createdCollectionStep,
-                planned: payload.planned,
-                computedSample: payload.computedSample
-              }
-            })
-          });
         }
 
-        return jsonRpcError(res, { id, code: -32601, message: `Unknown tool: ${toolNameRaw}` });
+        // 3) arma request usando modeId real
+        const planned = [];
+        const variableWrites = spec.tokens.map((t, i) => {
+          const existing = existingByName.get(t.name);
+          const action = existing ? "UPDATE" : "CREATE";
+          planned.push({ name: t.name, action });
+
+          return {
+            action,
+            id: existing?.id || `var_${i}`,
+            name: t.name,
+            variableCollectionId: collectionId,
+            resolvedType: "COLOR",
+            valuesByMode: {
+              [modeId]: t.rgba
+            }
+          };
+        });
+
+        const out = await figmaCreateVariables({
+          accessToken: token.access_token,
+          fileKey,
+          payload: { variableCollections: [], variables: variableWrites }
+        });
+
+        return res.json({
+          jsonrpc: "2.0",
+          id,
+          result: textResult({
+            ok: out.ok,
+            status: out.status,
+            responseBody: out.body,
+            typography: spec.typography,
+            note: out.ok ? "✅ Variables created/updated in Figma." : "❌ Figma rejected variable write.",
+            debug: {
+              usedCollectionId: collectionId,
+              usedModeId: modeId,
+              createdCollectionStep: ensured.created ? ensured.createdCollectionStep : null,
+              planned,
+              computedSample: spec.tokens.slice(0, 4).map((t) => ({
+                name: t.name,
+                hex: t.hex,
+                rgba: t.rgba,
+                modeId
+              }))
+            }
+          })
+        });
       }
 
-      return jsonRpcError(res, { id, code: -32601, message: "Unknown method" });
-    } catch (err) {
-      console.error("[MCP handleRpc] uncaught error:", err);
-      return jsonRpcError(res, {
+      // --- tokens_export_map ---
+      if (toolName === "tokens_export_map") {
+        const { fileKey } = args;
+        const vars = await figmaGetLocalVariables({ accessToken: token.access_token, fileKey });
+
+        const exportObj = {
+          localVariablesStatus: vars.status,
+          localVariablesOk: vars.ok,
+          localVariablesBody: vars.body,
+          export: buildCssExport({ brand: args.brand || { colors: {}, typography: {} } })
+        };
+
+        return res.json({ jsonrpc: "2.0", id, result: textResult(exportObj) });
+      }
+
+      // --- manifest store ---
+      if (toolName === "project_manifest_write") {
+        const { fileKey, manifest } = args;
+        const w = manifestStore.write({ fileKey, manifest });
+        return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, ...w }) });
+      }
+
+      if (toolName === "project_manifest_read") {
+        const { fileKey } = args;
+        const m = manifestStore.read({ fileKey });
+        return res.json({ jsonrpc: "2.0", id, result: textResult({ ok: true, manifest: m }) });
+      }
+
+      return res.json({
+        jsonrpc: "2.0",
         id,
-        code: -32000,
-        message: err?.message || "Tool call failed",
-        data: { stack: err?.stack }
+        error: { code: -32601, message: `Unknown tool: ${toolNameRaw}` }
       });
     }
+
+    return res.json({
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32601, message: "Unknown method" }
+    });
   }
 
+  // JSON-RPC endpoints
   app.post("/mcp", handleRpc);
   app.post("/mcp/sse", handleRpc);
 }
