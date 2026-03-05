@@ -171,7 +171,18 @@ function buildCssExport({ brand }) {
   return { globalsCssPreview, tokenMap };
 }
 
-// Flat schema for your endpoint
+// ✅ sanitize variable names (Figma rejects "." in your endpoint)
+function sanitizeVarName(name) {
+  // Convert dot notation to slash grouping, keep it readable
+  // "color.neutral.900" -> "color/neutral/900"
+  return String(name || "")
+    .trim()
+    .replace(/\.+/g, "/")         // "." -> "/"
+    .replace(/\/{2,}/g, "/")      // collapse
+    .replace(/^\//, "")           // no leading /
+    .replace(/\/$/, "");          // no trailing /
+}
+
 function buildVariableCreateMutationsFlat({ brand, collectionId, modeId = "Light" }) {
   const { colors, typography } = brand;
 
@@ -191,7 +202,8 @@ function buildVariableCreateMutationsFlat({ brand, collectionId, modeId = "Light
 
   const variables = [];
 
-  for (const [name, hex] of Object.entries({ ...prim, ...sem })) {
+  for (const [rawName, hex] of Object.entries({ ...prim, ...sem })) {
+    const name = sanitizeVarName(rawName);
     const rgba = hexToRgba01(hex) || hexToRgba01("#000000");
     variables.push({
       action: "CREATE",
@@ -288,7 +300,11 @@ export function attachMcpRoutes(app, tokenStore) {
         if (FIGMA_OAUTH_REQUIRED.has(toolName)) {
           const token = await (tokenStore?.load?.() ?? null);
           if (!token?.access_token) {
-            return jsonRpcError(res, { id, code: 401, message: "OAuth required: open /auth/figma/login first" });
+            return jsonRpcError(res, {
+              id,
+              code: 401,
+              message: "OAuth required: open /auth/figma/login first",
+            });
           }
           accessToken = token.access_token;
         }
@@ -313,7 +329,11 @@ export function attachMcpRoutes(app, tokenStore) {
         }
 
         if (toolName === "figma_get_nodes") {
-          const out = await figmaGetNodes({ accessToken, fileKey: args.fileKey, nodeIds: args.nodeIds });
+          const out = await figmaGetNodes({
+            accessToken,
+            fileKey: args.fileKey,
+            nodeIds: args.nodeIds,
+          });
           return res.json({ jsonrpc: "2.0", id, result: textResult(out.body) });
         }
 
@@ -342,16 +362,21 @@ export function attachMcpRoutes(app, tokenStore) {
             return res.json({
               jsonrpc: "2.0",
               id,
-              result: textResult({ ok: false, status: before.status, note: "Failed to read variables/local", responseBody: before.body }),
+              result: textResult({
+                ok: false,
+                status: before.status,
+                note: "Failed to read variables/local",
+                responseBody: before.body,
+              }),
             });
           }
 
           let collectionId = getFirstCollectionIdFromLocalVarsBody(before.body);
 
-          // Step B: if no collection, create it (response may not contain IDs)
-          let createCollectionResp = null;
+          // Step B: create collection if needed
+          let createdCollectionStep = null;
           if (!collectionId) {
-            createCollectionResp = await figmaCreateVariables({
+            const createCollectionResp = await figmaCreateVariables({
               accessToken,
               fileKey,
               payload: {
@@ -366,21 +391,33 @@ export function attachMcpRoutes(app, tokenStore) {
               },
             });
 
+            createdCollectionStep = { ok: createCollectionResp.ok, status: createCollectionResp.status };
+
             if (!createCollectionResp.ok) {
               return res.json({
                 jsonrpc: "2.0",
                 id,
-                result: textResult({ ok: false, status: createCollectionResp.status, note: "Failed to create collection", responseBody: createCollectionResp.body }),
+                result: textResult({
+                  ok: false,
+                  status: createCollectionResp.status,
+                  note: "Failed to create collection",
+                  responseBody: createCollectionResp.body,
+                }),
               });
             }
 
-            // Step C: re-read local vars to get the real collectionId
+            // Step C: re-read local vars to get id
             const after = await figmaGetLocalVariables({ accessToken, fileKey });
             if (!after.ok) {
               return res.json({
                 jsonrpc: "2.0",
                 id,
-                result: textResult({ ok: false, status: after.status, note: "Collection created but variables/local re-read failed", responseBody: after.body }),
+                result: textResult({
+                  ok: false,
+                  status: after.status,
+                  note: "Collection created but variables/local re-read failed",
+                  responseBody: after.body,
+                }),
               });
             }
 
@@ -393,17 +430,14 @@ export function attachMcpRoutes(app, tokenStore) {
                 result: textResult({
                   ok: false,
                   status: 500,
-                  note: "Collection create returned 200 but collectionId still not visible in variables/local meta.",
-                  debug: {
-                    createCollectionResponse: createCollectionResp.body,
-                    variablesLocalAfter: after.body,
-                  },
+                  note: "Collection created but collectionId still not visible in variables/local meta.",
+                  debug: { variablesLocalAfter: after.body },
                 }),
               });
             }
           }
 
-          // Step D: create variables
+          // Step D: create variables with sanitized names
           const payload = buildVariableCreateMutationsFlat({ brand, collectionId, modeId });
 
           const createVars = await figmaCreateVariables({
@@ -420,11 +454,14 @@ export function attachMcpRoutes(app, tokenStore) {
               status: createVars.status,
               responseBody: createVars.body,
               typography: payload.typography,
-              note: createVars.ok ? "✅ Variables created (or accepted) by Figma." : "❌ Figma rejected variable creation. See responseBody.",
+              note: createVars.ok
+                ? "✅ Variables created (or accepted) by Figma."
+                : "❌ Figma rejected variable creation. See responseBody.",
               debug: {
                 usedCollectionId: collectionId,
-                createdCollectionStep: createCollectionResp ? { ok: createCollectionResp.ok, status: createCollectionResp.status } : null,
+                createdCollectionStep,
                 variablesCount: payload.variables.length,
+                sampleNames: payload.variables.slice(0, 4).map((v) => v.name),
               },
             }),
           });
@@ -436,7 +473,12 @@ export function attachMcpRoutes(app, tokenStore) {
       return jsonRpcError(res, { id, code: -32601, message: "Unknown method" });
     } catch (err) {
       console.error("[MCP handleRpc] uncaught error:", err);
-      return jsonRpcError(res, { id, code: -32000, message: err?.message || "Tool call failed", data: { stack: err?.stack } });
+      return jsonRpcError(res, {
+        id,
+        code: -32000,
+        message: err?.message || "Tool call failed",
+        data: { stack: err?.stack },
+      });
     }
   }
 
