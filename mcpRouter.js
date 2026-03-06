@@ -6,6 +6,8 @@ import {
   figmaCreateVariables,
 } from "./figmaApi.js";
 import { createManifestStore } from "./manifestStore.js";
+import { generateFoundation, generateTypography, generateComponents } from "./designWriter.js";
+import { validateDesignSystem } from "./designValidator.js";
 
 /**
  * MCP tools exposed to the agent
@@ -94,6 +96,53 @@ const TOOLS = [
       required: ["fileKey"],
     },
   },
+  {
+    name: "design_generate_foundation",
+    description: "Create the base design-system page structure in Figma via the configured writer MCP.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fileKey: { type: "string" },
+        projectName: { type: "string" }
+      },
+      required: ["fileKey"]
+    }
+  },
+  {
+    name: "design_generate_typography",
+    description: "Create desktop-first light-mode typography styles in Figma via the configured writer MCP.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fileKey: { type: "string" },
+        brand: { type: "object" }
+      },
+      required: ["fileKey", "brand"]
+    }
+  },
+  {
+    name: "design_generate_components",
+    description: "Create Button, Input, Card, and Badge component sets with variants in Figma via the configured writer MCP.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fileKey: { type: "string" }
+      },
+      required: ["fileKey"]
+    }
+  },
+  {
+    name: "design_validate_system",
+    description: "Validate the design-system slice by checking pages, variables, typography markers, and component markers.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fileKey: { type: "string" },
+        projectName: { type: "string" }
+      },
+      required: ["fileKey"]
+    }
+  }
 ];
 
 function textResult(obj) {
@@ -534,6 +583,69 @@ export function attachMcpRoutes(app, tokenStore) {
         };
 
         return res.json({ jsonrpc: "2.0", id, result: textResult(exportObj) });
+      }
+
+      // -------------------------
+      // design_generate_foundation
+      // -------------------------
+      if (toolName === "design_generate_foundation") {
+        const out = await generateFoundation({
+          fileKey: args.fileKey,
+          projectName: args.projectName || "Project",
+        });
+        return res.json({ jsonrpc: "2.0", id, result: textResult(out) });
+      }
+
+      // -------------------------
+      // design_generate_typography
+      // -------------------------
+      if (toolName === "design_generate_typography") {
+        const out = await generateTypography({
+          fileKey: args.fileKey,
+          brand: args.brand || {},
+        });
+        return res.json({ jsonrpc: "2.0", id, result: textResult(out) });
+      }
+
+      // -------------------------
+      // design_generate_components
+      // -------------------------
+      if (toolName === "design_generate_components") {
+        const out = await generateComponents({ fileKey: args.fileKey });
+        return res.json({ jsonrpc: "2.0", id, result: textResult(out) });
+      }
+
+      // -------------------------
+      // design_validate_system
+      // -------------------------
+      if (toolName === "design_validate_system") {
+        const [fileOut, varsOut] = await Promise.all([
+          figmaGetFile({ accessToken: token.access_token, fileKey: args.fileKey }),
+          figmaGetLocalVariables({ accessToken: token.access_token, fileKey: args.fileKey }),
+        ]);
+
+        const fileBody = fileOut?.ok ? fileOut.body : null;
+        const variablesBody = varsOut?.ok ? varsOut.body : null;
+
+        const foundationManifest = manifestStore.read({ fileKey: args.fileKey }) || {};
+        const validation = validateDesignSystem({
+          fileBody,
+          variablesBody,
+          foundationResult: foundationManifest?.steps?.foundation,
+          typographyResult: foundationManifest?.steps?.typography,
+          componentsResult: foundationManifest?.steps?.components,
+        });
+
+        return res.json({
+          jsonrpc: "2.0",
+          id,
+          result: textResult({
+            ok: validation.status !== "fail",
+            validation,
+            fileStatus: fileOut.status,
+            variablesStatus: varsOut.status,
+          }),
+        });
       }
 
       // -------------------------
