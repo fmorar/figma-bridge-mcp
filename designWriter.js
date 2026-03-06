@@ -11,6 +11,7 @@ function getWriterConfig() {
 async function rpc({ url, authKey, method, params, timeoutMs }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -19,11 +20,29 @@ async function rpc({ url, authKey, method, params, timeoutMs }) {
         Accept: "application/json",
         ...(authKey ? { Authorization: `Bearer ${authKey}` } : {}),
       },
-      body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: Date.now(),
+        method,
+        params,
+      }),
       signal: controller.signal,
     });
-    const body = await res.json().catch(async () => ({ raw: await res.text() }));
-    return { ok: res.ok && !body?.error, status: res.status, body };
+
+    const raw = await res.text();
+
+    let body;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      body = { raw };
+    }
+
+    return {
+      ok: res.ok && !body?.error,
+      status: res.status,
+      body,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -42,6 +61,7 @@ async function callRemoteTool(config, name, args) {
       },
     };
   }
+
   const out = await rpc({
     url: config.url,
     authKey: config.authKey,
@@ -49,11 +69,13 @@ async function callRemoteTool(config, name, args) {
     params: { name, arguments: args },
     timeoutMs: config.timeoutMs,
   });
+
   return out;
 }
 
 export async function generateFoundation({ fileKey, projectName = "Project" }) {
   const config = getWriterConfig();
+
   const payload = {
     fileKey,
     pages: FOUNDATION_PAGES.map((page) =>
@@ -86,6 +108,7 @@ export async function generateFoundation({ fileKey, projectName = "Project" }) {
 export async function generateTypography({ fileKey, brand }) {
   const config = getWriterConfig();
   const fontFamily = brand?.typography?.fontFamily || "Inter";
+
   const payload = {
     fileKey,
     fontFamily,
@@ -108,6 +131,7 @@ export async function generateTypography({ fileKey, brand }) {
 
 export async function generateComponents({ fileKey }) {
   const config = getWriterConfig();
+
   const payload = {
     fileKey,
     components: COMPONENT_SPECS,
